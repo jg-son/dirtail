@@ -1,0 +1,194 @@
+#!/bin/bash
+#
+# dirtail - A "tail -f" helper for monitoring all current and subsequent files in a folder.
+#
+# v1.0 2012-09-14 Johan Gadsjo
+#  - Considered stable
+#
+# v0.3 2011-10-10 Johan Gadsjo
+#  - Support multiple directories as argument
+#
+# v0.2 2011-03-01 Johan Gadsjo
+#  - Fix caught signals
+#  - Fix getopt parsing
+#  - Fix usage 
+# 
+# v0.1 2010-11-15 Johan Gadsjo 
+#  - Inital version
+#
+# TODO: see pod below
+#
+: <<END_OF_POD
+Embedded pod
+
+=head1 NAME
+
+dirtail - follow tail on all files in a directory
+
+=head1 SYNOPSIS
+
+B<dirtail> [B<-W>] [B<-f> min] [B<-r> sec] [B<-p> 'pat'] [dir ...]
+
+=head1 DESCRIPTION
+
+For each given B<dir>, start following the tail on all files that has a modification time newer then B<min> or that is being created after program start.
+
+B<-f> min   How B<f>resh files should we start tailing at startup. (value in integer minutes, default is 10).
+
+B<-r> sec   How often to B<r>eread directory listing. (value in integer seconds, default is 5)
+
+B<-W>       Don't B<w>rap lines
+
+B<-p> 'pat' File name B<p>attern (default is *.log). Remember to quote globs.
+
+dir      directory to monitor (default is . ).
+
+=head1 EXAMPLE
+
+dirtail
+
+dirtail -W -f 15 -r 10 -p '*.log'
+
+dirtail dir1 dir2 dir3 | fgrep 'ERROR 4711'
+
+=head1 NOTICE
+
+Sometimes the cygwin clock gets out of sync with windows system clock. The solution is to increase -r sec.
+
+Windows also has another weirdness. Sometimes the modification timestamps on files and directories stops
+getting updated on files still open (a performance tweek I guess). This also effectively stops dirtail from doing a proper job.
+( see http://social.technet.microsoft.com/Forums/en-US/winservergen/Thread/2B8BACA2-9C1B-4D80-80ED-87A3D6B1336F
+and http://blogs.technet.com/b/asiasupp/archive/2010/12/14/file-date-modified-property-are-not-updating-while-modifying-a-file-without-closing-it.aspx )
+If solution could be to pass a big number as the -f argument
+
+By default dirtail usees *.log as file matching pattern. This is because we don't want core dump files to be sent to the terminal by mistake.
+
+=head1 TODO
+
+dirtail is lacking support for files and directories containing spaces.
+Add support for files and directories with spaces.
+Add support for inotifywait when present.
+Kill stalled backgroud tail processes.
+=cut
+
+END_OF_POD
+
+defaultfresh=10
+defaultrefresh=5
+defaultpattern="*.log"
+
+printusage() {
+	# -h prints this help
+	echo "Usage: $0"' [-W] [-f min] [-r sec] [-p '"'pat'"'] [dir ...]'
+	echo "	dir	directory to monitor. (default is . )"
+	echo "	-f min	How Fresh files should we start tailing at startup."
+	echo "		 (value in integer minutes, default is ${defaultfresh})."
+	echo "	-r sec	How often to Reread directory listing."
+	echo "		 (value in integer seconds, default is ${defaultrefresh})"
+	echo "	-W	No Wrap lines"
+	echo "	-p 'pat'	File name Pattern. (default is *.log) Remember to quote globs."
+	exit 0;
+}
+
+log() {
+	# ${1:0:2} is the two first characters of $1
+	if [ "x${1:0:2}" = "x-l" ]; then
+		COLUMNS=0
+		MSG=${@:2}
+	else
+		COLUMNS=`stty size | awk '{print $2;}'`
+		MSG=$@
+	fi
+	printf "\e[0;1m%${COLUMNS}s\e[0m\n" "$MSG" 1>&2
+}
+
+die() {
+	log "$@"
+	for pid in `jobs -p`; do
+		kill $pid 2>/dev/null
+	done
+	sleep 0.1
+	#do we still have running bg processes=?
+	if [ "x`jobs -rp`" != "x" ]; then
+		log "failed to kill bg jobs"
+		jobs -p
+		log "`jobs -l`"
+	fi
+	exit 1;
+} 
+
+# Catch ^C 
+trap "die -l Punt!" SIGINT SIGTERM SIGHUP SIGPIPE
+
+# Read command line with getopts
+while getopts "f:hr:p:W" readopt ; do
+    [ "$readopt" = "h" ] && printusage
+    [ "$readopt" = "?" ] && printusage
+    export $readopt="${OPTARG:-true}"
+done
+shift $(( $OPTIND - 1 ))
+o_nowrap=${W:-false}
+o_fresh=${f:-${defaultfresh}}
+o_refresh=${r:-${defaultrefresh}}
+o_pattern=${p:-${defaultpattern}}
+
+
+# CWD
+DIR=""
+if [ $# -eq 0 ]; then
+	DIR=.
+fi
+
+while [ $# -gt 0 ]; do
+	if ! fgrep -q ' ' <<< "$1"; then
+		if [ -d "$1" ]; then
+			DIR="${DIR} $1"
+		else
+			log "Skipping file is not a directory: $1"
+		fi
+	else
+		log "Skipping dir with space: $1"
+	fi
+	shift;
+done
+if [ "x$DIR" = "x" ]; then
+	die "Everyday Mystery...   "
+fi
+
+# Start tailing files
+FILES=`find $DIR -maxdepth 1 -type f -mmin -${o_fresh} -iname "${o_pattern}" -not -name '* *'`
+if [ "x$FILES" = "x" ]; then
+	log "No files found. Try dirtail -f 1440";
+fi
+for f in $FILES; do
+	log "Tailing ${f}"
+	if [ "$o_nowrap" = "true" ]; then
+		COLUMNS=`stty size | awk '{print $2;}'`
+		tail -n 3 -f $f | cut -c1-${COLUMNS} &
+	else
+		tail -n 3 -f $f &
+	fi
+done
+
+# start watching for new files
+while true; do
+	sleep $o_refresh || die "Gaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaah!"
+	NFILES=`find $DIR -maxdepth 1 -type f -mmin -1 -iname "${o_pattern}" -not -name '* *'`
+	# for every new file found
+	for f in ${NFILES}; do
+		if ! grep -q "$f" <<< "$FILES"; then
+			log "Tailing ${f}"
+			if [ "$o_nowrap" = "true" ]; then
+				COLUMNS=`stty size | awk '{print $2;}'`
+				tail -n+1 -f $f | cut -c1-${COLUMNS} &
+			else
+				tail -n+1 -f $f &
+			fi
+			FILES="${FILES} ${f}"
+		fi
+	done
+done
+
+#
+# vim: autoindent tabstop=2 shiftwidth=2 expandtab softtabstop=2 filetype=sh
+#
